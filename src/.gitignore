@@ -1,0 +1,16 @@
+# Rust build artifacts (this folder gets massive, never push it)
+/target/
+
+# Runtime generated files
+*.bin
+
+# IDE and Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
