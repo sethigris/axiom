@@ -1,4 +1,7 @@
+
 # Axiom 
+
+![Axiom Logo](/axiom.png)
 
 **A bare-metal, tiny deep learning engine in Rust with cross-platform GPU acceleration.**
 
