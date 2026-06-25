@@ -437,9 +437,17 @@ impl Tensor {
         if self.is_contiguous() {
             return self.clone();
         }
+
         let out = Tensor::empty(self.dtype, self.shape.clone());
         crate::kernels::copy(self, &out);
-        out
+
+        // FIX: Attach the Autograd node so gradients can flow back through the memory copy!
+        if self.requires_grad {
+            let op = std::sync::Arc::new(crate::ops::contiguous::ContiguousOp);
+            out.with_node(op, vec![self.clone()])
+        } else {
+            out
+        }
     }
 
     /// Zero-cost reshaping. If the tensor is non-contiguous, it forces a copy first.
@@ -511,7 +519,7 @@ impl Tensor {
         let stride_0 = self.strides.steps()[0];
         let byte_shift = (batch_idx as isize * stride_0) as usize * self.dtype.size_in_bytes();
 
-        Tensor {
+        let out = Tensor {
             id: TensorId::next(),
             dtype: self.dtype,
             shape: Shape::new([m, n]),
@@ -519,9 +527,20 @@ impl Tensor {
             storage: self.storage.clone(),
             byte_offset: self.byte_offset + byte_shift,
             device: self.device.clone(),
-            requires_grad: false, // Internal view for manual batching
+            requires_grad: self.requires_grad,
             grad: None,
             node: None,
+        };
+
+        // FIX: Attach the Autograd node if gradients are required!
+        if self.requires_grad {
+            let op = std::sync::Arc::new(crate::ops::slice::GetSliceOp {
+                batch_idx,
+                parent_shape: self.shape.clone(),
+            });
+            out.with_node(op, vec![self.clone()])
+        } else {
+            out
         }
     }
 

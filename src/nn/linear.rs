@@ -1,6 +1,4 @@
-use crate::ops::linear_fused::FusedLinearOp;
 use crate::{DType, Shape, Tensor};
-use std::sync::Arc;
 
 pub struct Linear {
     pub weight: Tensor,
