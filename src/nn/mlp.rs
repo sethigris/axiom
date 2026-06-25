@@ -1,0 +1,22 @@
+use crate::{Linear, Tensor};
+
+pub struct FeedForward {
+    pub linear1: Linear,
+    pub linear2: Linear,
+}
+
+impl FeedForward {
+    pub fn new(hidden_dim: usize) -> Self {
+        let ff_dim = hidden_dim * 4; // Standard 4x expansion
+        Self {
+            linear1: Linear::new(hidden_dim, ff_dim),
+            linear2: Linear::new(ff_dim, hidden_dim),
+        }
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Tensor {
+        let h = self.linear1.forward(x);
+        let h = h.relu();
+        self.linear2.forward(&h)
+    }
+}

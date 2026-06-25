@@ -1,46 +1,48 @@
-use axiom::{DType, MultiHeadAttention, Shape, Tensor};
+use axiom::{DType, PositionalEncoding, Shape, Tensor, TransformerBlock};
 use std::time::Instant;
 
 fn main() {
-    println!(" Running Axiom Multi-Head Attention Test\n");
+    println!(" Running Axiom Full Transformer Block Test\n");
 
-    // 1. Generate the missing dummy data!
     let batch = 2;
     let seq = 16;
     let hidden = 64;
+    let num_heads = 4;
     let total_elements = batch * seq * hidden;
 
+    // 1. Dummy Input (e.g., Word Embeddings)
     let data: Vec<f32> = (0..total_elements)
         .map(|i| (i % 100) as f32 * 0.01)
         .collect();
-
-    // 2. Create an input sequence: [Batch, Sequence, Hidden]
     let x = Tensor::from_slice(DType::F32, Shape::new([batch, seq, hidden]), &data)
         .requires_grad_(true);
 
-    // 3. Initialize Multi-Head Attention
-    let mha = MultiHeadAttention::new(hidden, 4); // 64 hidden dim, 4 heads
+    // 2. Inject Positional Information
+    let pos_enc = PositionalEncoding::new(batch, seq, hidden);
+    let x_with_pos = pos_enc.forward(&x);
 
-    // 4. Forward pass (Utilizes zero-cost transposes and fused 2D GEMMs)
+    // 3. Initialize the Transformer Block
+    let block = TransformerBlock::new(hidden, num_heads);
+
+    // --- FORWARD PASS ---
+    println!("Starting Forward Pass (Attention + MLP + Residuals)...");
     let start = Instant::now();
-    let out = mha.forward(&x);
-    println!(" Forward pass took: {:?}", start.elapsed());
+    let out = block.forward(&x_with_pos);
+    println!("Forward pass took: {:?}", start.elapsed());
     println!("Output shape: {:?}\n", out.shape);
 
-    // 5. Backward pass (Autograd traverses the 4D graph)
+    // --- BACKWARD PASS ---
+    println!("Starting Backward Pass...");
     let loss = out.sum();
 
     let start = Instant::now();
     let grads = loss.backward();
-    println!(" Backward pass took: {:?}", start.elapsed());
+    println!("ackward pass took: {:?}", start.elapsed());
 
-    // We use `if let` instead of `.unwrap()` so it doesn't crash if the
-    // gradient is missing due to the raw `copy` kernel boundary!
     if let Some(x_grad) = grads.get(&x.id) {
-        println!("SUCCESS! Input Gradient shape: {:?}", x_grad.shape);
+        println!("\nSUCCESS! Input Gradient shape: {:?}", x_grad.shape);
+        println!("The full Transformer Block (Attn + MLP + Residuals) backpropagated perfectly.");
     } else {
-        println!(
-            " Gradient for 'x' missing (This is expected until I apply the `Tensor::cat` fix)."
-        );
+        println!("\nGradient missing.");
     }
 }

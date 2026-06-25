@@ -1,6 +1,13 @@
-pub mod linear;
-pub use linear::Linear;
 pub mod attention;
-pub use attention::MultiHeadAttention;
 pub mod layer_norm;
+pub mod linear;
+pub mod mlp;
+pub mod positional_encoding;
+pub mod transformer;
+
+pub use attention::MultiHeadAttention;
 pub use layer_norm::LayerNorm;
+pub use linear::Linear;
+pub use mlp::FeedForward;
+pub use positional_encoding::PositionalEncoding;
+pub use transformer::TransformerBlock;
