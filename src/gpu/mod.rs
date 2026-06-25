@@ -17,7 +17,7 @@ pub struct GpuContext {
     fused_linear_bind_group_layout: wgpu::BindGroupLayout,
     sgd_pipeline: wgpu::ComputePipeline,
     sgd_bind_group_layout: wgpu::BindGroupLayout,
-    pub arena: arena::GpuMemoryArena,
+    pub arena: Arc<arena::GpuMemoryArena>,
     batched_matmul_pipeline: wgpu::ComputePipeline,
     batched_matmul_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -88,7 +88,7 @@ impl GpuContext {
                 ],
             });
 
-        let arena = arena::GpuMemoryArena::new(&device, 256); // 256MB Arena 
+        let arena = arena::GpuMemoryArena::new();
 
         // 6. Create the pipeline layout and the compute pipeline
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -541,8 +541,7 @@ impl GpuContext {
         let a_alloc = a.storage.get_gpu_allocation().unwrap();
         let b_alloc = b.storage.get_gpu_allocation().unwrap();
 
-        // ARENA ALLOCATION
-        let out_alloc = ctx.arena.allocate(bytes as u64);
+        let out_alloc = ctx.arena.allocate(&ctx.device, bytes as u64); // <--- FIXED
 
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -592,9 +591,6 @@ impl GpuContext {
         }
     }
 
-    /// GPU-resident matrix multiplication: C = A @ B
-    /// All inputs and outputs stay on GPU. Uses tiled shared memory for performance.
-
     pub fn matmul_gpu_resident(ctx: &Arc<GpuContext>, a: &Tensor, b: &Tensor) -> Tensor {
         assert!(
             a.storage.is_gpu() && b.storage.is_gpu(),
@@ -614,8 +610,7 @@ impl GpuContext {
         let a_alloc = a.storage.get_gpu_allocation().unwrap();
         let b_alloc = b.storage.get_gpu_allocation().unwrap();
 
-        // ARENA ALLOCATION
-        let out_alloc = ctx.arena.allocate(out_bytes as u64);
+        let out_alloc = ctx.arena.allocate(&ctx.device, out_bytes as u64); // <--- FIXED
 
         let params_data: [u32; 4] = [m as u32, k as u32, n as u32, 0];
         let params_buffer = ctx
@@ -696,8 +691,7 @@ impl GpuContext {
         let w_alloc = w.storage.get_gpu_allocation().unwrap();
         let bias_alloc = bias.storage.get_gpu_allocation().unwrap();
 
-        // ARENA ALLOCATION
-        let out_alloc = ctx.arena.allocate(out_bytes as u64);
+        let out_alloc = ctx.arena.allocate(&ctx.device, out_bytes as u64); // <--- FIXED
 
         let params_data: [u32; 4] = [m as u32, k as u32, n as u32, 0];
         let params_buf = ctx
@@ -763,60 +757,6 @@ impl GpuContext {
         }
     }
 
-    pub fn sgd_step_gpu(ctx: &Arc<GpuContext>, weight: &Tensor, grad: &Tensor, lr: f32) {
-        assert!(
-            weight.storage.is_gpu() && grad.storage.is_gpu(),
-            "Both weight and grad must be on GPU for GPU SGD"
-        );
-        assert_eq!(weight.shape, grad.shape);
-
-        let w_alloc = weight.storage.get_gpu_allocation().unwrap();
-        let g_alloc = grad.storage.get_gpu_allocation().unwrap();
-
-        let params_data: [f32; 4] = [lr, 0.0, 0.0, 0.0];
-        let params_buf = ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("sgd_params"),
-                contents: bytemuck::cast_slice(&params_data),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sgd_bg"),
-            layout: &ctx.sgd_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: w_alloc.as_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: g_alloc.as_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&ctx.sgd_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = ((weight.shape.num_elements() + 255) / 256) as u32;
-            pass.dispatch_workgroups(workgroups, 1, 1);
-        }
-        ctx.queue.submit(std::iter::once(encoder.finish()));
-    }
-
     pub fn batched_matmul_gpu_resident(
         ctx: &Arc<GpuContext>,
         a: &Tensor,
@@ -840,7 +780,7 @@ impl GpuContext {
         let out_bytes = batch * m * n * std::mem::size_of::<f32>();
         let a_alloc = a.storage.get_gpu_allocation().unwrap();
         let b_alloc = b.storage.get_gpu_allocation().unwrap();
-        let out_alloc = ctx.arena.allocate(out_bytes as u64);
+        let out_alloc = ctx.arena.allocate(&ctx.device, out_bytes as u64); // <--- FIXED
 
         let t_b = if transpose_b { 1u32 } else { 0u32 };
         let params_data: [u32; 8] = [
@@ -895,7 +835,6 @@ impl GpuContext {
             pass.set_pipeline(&ctx.batched_matmul_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
 
-            // Z dimension handles the batch!
             let wg_x = ((n + 15) / 16) as u32;
             let wg_y = ((m + 15) / 16) as u32;
             let wg_z = batch as u32;
@@ -915,6 +854,60 @@ impl GpuContext {
             grad: None,
             node: None,
         }
+    }
+
+    pub fn sgd_step_gpu(ctx: &Arc<GpuContext>, weight: &Tensor, grad: &Tensor, lr: f32) {
+        assert!(
+            weight.storage.is_gpu() && grad.storage.is_gpu(),
+            "Both weight and grad must be on GPU for GPU SGD"
+        );
+        assert_eq!(weight.shape, grad.shape);
+
+        let w_alloc = weight.storage.get_gpu_allocation().unwrap();
+        let g_alloc = grad.storage.get_gpu_allocation().unwrap();
+
+        let params_data: [f32; 4] = [lr, 0.0, 0.0, 0.0];
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sgd_params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sgd_bg"),
+            layout: &ctx.sgd_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: w_alloc.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: g_alloc.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&ctx.sgd_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = ((weight.shape.num_elements() + 255) / 256) as u32;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
     }
 }
 

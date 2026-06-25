@@ -289,15 +289,15 @@ impl Tensor {
     /// Transfers tensor data between CPU and GPU.
     pub fn to(&self, device: Device) -> Tensor {
         if self.device == device {
-            return self.clone(); // Already on the target device
+            return self.clone();
         }
 
         match (&self.device, &device) {
             (Device::Cpu, Device::Gpu(gpu_ctx)) => {
                 let data = self.to_contiguous_bytes();
 
-                // 1. Allocate space in the Arena
-                let alloc = gpu_ctx.arena.allocate(data.len() as u64);
+                // 1. Allocate space using the Caching Allocator
+                let alloc = gpu_ctx.arena.allocate(&gpu_ctx.device, data.len() as u64); // <--- FIXED
 
                 // 2. Create a temporary staging buffer to hold the CPU bytes
                 let staging =
@@ -309,17 +309,11 @@ impl Tensor {
                             usage: wgpu::BufferUsages::COPY_SRC,
                         });
 
-                // 3. Copy from staging -> Arena block
+                // 3. Copy from staging -> Cached Buffer
                 let mut encoder = gpu_ctx
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                encoder.copy_buffer_to_buffer(
-                    &staging,
-                    0,
-                    &alloc.buffer,
-                    alloc.offset,
-                    data.len() as u64,
-                );
+                encoder.copy_buffer_to_buffer(&staging, 0, &alloc.buffer, 0, data.len() as u64); // <--- FIXED offset to 0
                 gpu_ctx.queue.submit(std::iter::once(encoder.finish()));
 
                 Tensor {
@@ -327,7 +321,7 @@ impl Tensor {
                     dtype: self.dtype,
                     shape: self.shape.clone(),
                     strides: self.strides.clone(),
-                    storage: Arc::new(CpuStorage::from_gpu_allocation(alloc)), // Only ONE storage field
+                    storage: Arc::new(CpuStorage::from_gpu_allocation(alloc)),
                     byte_offset: 0,
                     device: Device::Gpu(gpu_ctx.clone()),
                     requires_grad: self.requires_grad,
@@ -335,9 +329,7 @@ impl Tensor {
                     node: None,
                 }
             }
-
             (Device::Gpu(_), Device::Cpu) => {
-                // GPU -> CPU: Download data from VRAM
                 let bytes = self.download_from_gpu();
 
                 Tensor {
@@ -355,6 +347,43 @@ impl Tensor {
             }
             _ => panic!("Unsupported device transfer"),
         }
+    }
+
+    fn download_from_gpu(&self) -> Vec<u8> {
+        let gpu_ctx = match &self.device {
+            Device::Gpu(ctx) => ctx,
+            _ => panic!("Not a GPU tensor"),
+        };
+
+        let alloc = self.storage.get_gpu_allocation().unwrap();
+        let bytes = self.shape.num_elements() * self.dtype.size_in_bytes();
+
+        let staging = gpu_ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: bytes as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = gpu_ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Copy from Cached Buffer -> staging buffer
+        encoder.copy_buffer_to_buffer(&alloc.buffer, 0, &staging, 0, bytes as wgpu::BufferAddress); // <--- FIXED offset to 0
+        gpu_ctx.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        gpu_ctx.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let result = data.to_vec();
+        drop(data);
+        staging.unmap();
+
+        result
     }
 
     /// Materializes tensor data into a contiguous byte Vec (handles strides).
@@ -383,49 +412,6 @@ impl Tensor {
             let val = unsafe { *ptr.add(offset as usize + base) };
             result.extend_from_slice(&val.to_le_bytes());
         }
-
-        result
-    }
-
-    fn download_from_gpu(&self) -> Vec<u8> {
-        let gpu_ctx = match &self.device {
-            Device::Gpu(ctx) => ctx,
-            _ => panic!("Not a GPU tensor"),
-        };
-
-        let alloc = self.storage.get_gpu_allocation().unwrap(); // <--- Use allocation
-        let bytes = self.shape.num_elements() * self.dtype.size_in_bytes();
-
-        let staging = gpu_ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size: bytes as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = gpu_ctx.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: None }, // <--- Fixed the .. typo
-        );
-        // Copy from Arena block -> staging buffer
-        encoder.copy_buffer_to_buffer(
-            &alloc.buffer,
-            alloc.offset,
-            &staging,
-            0,
-            bytes as wgpu::BufferAddress,
-        );
-        gpu_ctx.queue.submit(std::iter::once(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-        gpu_ctx.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().unwrap();
-
-        let data = slice.get_mapped_range();
-        let result = data.to_vec();
-        drop(data);
-        staging.unmap();
 
         result
     }
