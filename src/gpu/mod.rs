@@ -20,6 +20,8 @@ pub struct GpuContext {
     pub arena: Arc<arena::GpuMemoryArena>,
     batched_matmul_pipeline: wgpu::ComputePipeline,
     batched_matmul_bind_group_layout: wgpu::BindGroupLayout,
+    adamw_pipeline: wgpu::ComputePipeline,
+    adamw_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl GpuContext {
@@ -382,6 +384,89 @@ impl GpuContext {
                 compilation_options: Default::default(),
             });
 
+        // --- AdamW Pipeline ---
+        let adamw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("adamw_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/adamw.wgsl").into()),
+        });
+
+        let adamw_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("adamw_bind_group_layout"),
+                entries: &[
+                    // 0: weight (read_write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 1: grad (read)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 2: m (read_write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 3: v (read_write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // 4: params (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let adamw_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("adamw_pipeline_layout"),
+                bind_group_layouts: &[&adamw_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let adamw_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("adamw_pipeline"),
+            layout: Some(&adamw_pipeline_layout),
+            module: &adamw_shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+
         Arc::new(Self {
             device,
             queue,
@@ -396,6 +481,8 @@ impl GpuContext {
             arena,
             batched_matmul_pipeline,
             batched_matmul_bind_group_layout,
+            adamw_bind_group_layout: adamw_bind_group_layout,
+            adamw_pipeline: adamw_pipeline,
         })
     }
 
@@ -903,6 +990,72 @@ impl GpuContext {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&ctx.sgd_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = ((weight.shape.num_elements() + 255) / 256) as u32;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    pub fn adamw_step_gpu(
+        ctx: &Arc<GpuContext>,
+        weight: &Tensor,
+        grad: &Tensor,
+        m: &Tensor,
+        v: &Tensor,
+        params: [f32; 8],
+    ) {
+        assert!(weight.storage.is_gpu() && grad.storage.is_gpu());
+
+        let w_alloc = weight.storage.get_gpu_allocation().unwrap();
+        let g_alloc = grad.storage.get_gpu_allocation().unwrap();
+        let m_alloc = m.storage.get_gpu_allocation().unwrap();
+        let v_alloc = v.storage.get_gpu_allocation().unwrap();
+
+        let params_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("adamw_params"),
+                contents: bytemuck::cast_slice(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("adamw_bg"),
+            layout: &ctx.adamw_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: w_alloc.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: g_alloc.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: m_alloc.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: v_alloc.as_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&ctx.adamw_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let workgroups = ((weight.shape.num_elements() + 255) / 256) as u32;
             pass.dispatch_workgroups(workgroups, 1, 1);
