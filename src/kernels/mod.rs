@@ -7,6 +7,8 @@ pub mod concat;
 pub mod layer_norm;
 pub mod matmul;
 pub mod reduce;
+pub mod rope;
+pub use rope::{rope_backward, rope_forward};
 
 pub use activations::{relu, relu_backward, scalar_mul, softmax, softmax_backward};
 pub use binary::add;

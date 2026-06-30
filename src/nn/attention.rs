@@ -37,41 +37,50 @@ impl MultiHeadAttention {
         let d = self.head_dim;
         let scale = 1.0 / (d as f32).sqrt();
 
-        // Pre-LN: Normalize before projecting!
+        // 1. Pre-LN
         let x_norm = self.norm.forward(x);
 
+        // 2. Project Q, K, V -> [B, S, Hidden]
         let q = self.q_proj.forward(&x_norm);
         let k = self.k_proj.forward(&x_norm);
         let v = self.v_proj.forward(&x_norm);
 
-        // 2. Split heads -> [B, S, H, D] -> Transpose to [B, H, S, D]
-        let q = q.view(Shape::new([b, s, h, d])).transpose(1, 2);
-        let k = k.view(Shape::new([b, s, h, d])).transpose(1, 2);
-        let v = v.view(Shape::new([b, s, h, d])).transpose(1, 2);
+        // 3. Split heads -> [B, H, S, D] -> Flatten to [B*H, S, D]
+        let mut q = q
+            .view(Shape::new([b, s, h, d]))
+            .transpose(1, 2)
+            .view(Shape::new([b * h, s, d]));
+        let mut k = k
+            .view(Shape::new([b, s, h, d]))
+            .transpose(1, 2)
+            .view(Shape::new([b * h, s, d]));
+        let v = v
+            .view(Shape::new([b, s, h, d]))
+            .transpose(1, 2)
+            .view(Shape::new([b * h, s, d]));
 
-        // 3. Flatten B and H to reuse 3D Batched MatMul -> [B*H, S, D]
-        let q_flat = q.view(Shape::new([b * h, s, d]));
-        let k_flat = k.view(Shape::new([b * h, s, d]));
-        let v_flat = v.view(Shape::new([b * h, s, d]));
+        // 4. Apply RoPE strictly to Q and K
+        let rope = crate::nn::rope::RoPE::new(d, 10000.0);
+        q = rope.forward(&q);
+        k = rope.forward(&k);
 
-        // FIX: LayerNorm forces tensors to CPU. We must explicitly move
-        // them to the GPU to trigger the Flash-Attention WGSL shader!
-        let gpu_device = crate::Device::gpu();
-        let q_gpu = q_flat.to(gpu_device.clone());
-        let k_gpu = k_flat.to(gpu_device.clone());
-        let v_gpu = v_flat.to(gpu_device.clone());
+        // 5. Flash-Attention
+        // Extract the exact device from the model weights.
+        // Do not call Device::gpu() here, as it may spawn a conflicting logical device.
+        let gpu_device = self.q_proj.weight.device.clone();
+        let q_gpu = q.to(gpu_device.clone());
+        let k_gpu = k.to(gpu_device.clone());
+        let v_gpu = v.to(gpu_device.clone());
 
-        // 4. Flash-Attention (Zero O(N^2) VRAM allocation!)
-        // The shader computes Q*K^T, Softmax, and multiplies by V all in L1 Cache!
         let ctx = q_gpu.flash_attention(&k_gpu, &v_gpu, scale);
 
-        // 5. Reassemble heads -> [B*H, S, D] -> [B, H, S, D] -> [B, S, H, D] -> [B, S, Hidden]
+        // 6. Reassemble heads -> [B*H, S, D] -> [B, H, S, D] -> [B, S, H, D] -> [B, S, Hidden]
         let out = ctx
             .view(Shape::new([b, h, s, d]))
             .transpose(1, 2)
             .view(Shape::new([b, s, h * d]));
 
-        // 6. Final output projection
+        // 7. Final output projection
         self.out_proj.forward(&out)
     }
 }

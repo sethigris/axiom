@@ -6,6 +6,7 @@ pub mod layer_norm;
 pub mod linear_fused;
 pub mod matmul;
 pub mod relu;
+pub mod rope;
 pub mod scalar_mul;
 pub mod slice;
 pub mod softmax;

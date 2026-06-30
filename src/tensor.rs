@@ -5,7 +5,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use wgpu::util::DeviceExt;
 
 static NEXT_TENSOR_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -296,19 +295,11 @@ impl Tensor {
             (Device::Cpu, Device::Gpu(gpu_ctx)) => {
                 let data = self.to_contiguous_bytes();
                 let alloc = gpu_ctx.arena.allocate(&gpu_ctx.device, data.len() as u64);
-                let staging =
-                    gpu_ctx
-                        .device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("cpu_to_gpu_staging"),
-                            contents: &data,
-                            usage: wgpu::BufferUsages::COPY_SRC,
-                        });
-                let mut encoder = gpu_ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                encoder.copy_buffer_to_buffer(&staging, 0, &alloc.buffer, 0, data.len() as u64);
-                gpu_ctx.queue.submit(std::iter::once(encoder.finish()));
+
+                // Use queue.write_buffer instead of manual staging buffers.
+                // This eliminates wgpu lifecycle validation errors caused by dropping
+                // staging buffers before the GPU finishes processing the command queue.
+                gpu_ctx.queue.write_buffer(&alloc.buffer, 0, &data);
 
                 Tensor {
                     id: TensorId::next(),

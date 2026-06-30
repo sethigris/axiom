@@ -11,3 +11,6 @@ pub use linear::Linear;
 pub use mlp::FeedForward;
 pub use positional_encoding::PositionalEncoding;
 pub use transformer::TransformerBlock;
+
+pub mod rope;
+pub use rope::RoPE;

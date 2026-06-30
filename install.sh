@@ -11,7 +11,7 @@ OS="$(uname -s)"
 case "${OS}" in
     Linux*)     PLATFORM="linux";;
     Darwin*)    PLATFORM="macos";;
-    *)          echo " Unsupported OS: ${OS}"; exit 1;;
+    *)          echo "Unsupported OS: ${OS}"; exit 1;;
 esac
 
 ARCH="$(uname -m)"
@@ -37,5 +37,5 @@ sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 rm -rf "${TMP_DIR}"
 
 echo ""
-echo " Axiom successfully installed!"
+echo "Axiom successfully installed!"
 echo "Run 'axiom' anywhere in your terminal to get started."
